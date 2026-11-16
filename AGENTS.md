@@ -26,6 +26,10 @@ and the CLI) under a React UI. See the README.
   and the canvas renderers. `src/song/`: Sing's tunes, fitting words to them, clip recording.
 - `tests/`: bun tests on the wasm build. `tools/`: e2e, layout lint, spectrogram, speech judges
   (`asr/` Whisper, `tsp/` the real speakers' data).
+- Tapes (short videos of heads replaying renders; this fork's, not upstream's): `tools/tape/`
+  builds a show from CLI renders (`tape.ts`) and records it (`record.ts`, `shoot.ts`);
+  `src/tape/` is the page (`?tape=<id>`); `tapes/<id>/` holds one video's `script.ts` (what
+  sounds when) and `layout.ts` (what is drawn). Start from `tapes/sample/`.
 - `docs/`: architecture, the engine contract (`rust-engine.md`), the UI look, the singer and
   speech judges, the hill-climb rules, and how a language plugs in (`language-front-ends.md`).
 
