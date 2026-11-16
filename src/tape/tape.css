@@ -1,0 +1,38 @@
+/* the tape page (?tape=<id>): one stage canvas, the size of the video frame, fitted to the window */
+.tape {
+  position: fixed;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  overflow: hidden;
+  background: #000;
+}
+
+.tape-stage {
+  position: relative;
+  max-width: 100vw;
+  max-height: 100vh;
+  background: #000;
+}
+
+/* the heads' own canvases: drawn here, shown only as copies on the stage */
+.tape-panes {
+  position: absolute;
+  left: 0;
+  top: 0;
+  display: flex;
+  opacity: 0;
+  pointer-events: none;
+}
+
+.tape-pane {
+  position: relative;
+  flex: none;
+}
+
+.tape-msg {
+  position: relative;
+  padding: 24px;
+  text-align: center;
+  color: var(--amber);
+}

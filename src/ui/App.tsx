@@ -26,9 +26,12 @@ const AnatomyView3D = lazy(() => import("./components/AnatomyView3D.tsx").then((
 // the duet page (`?show=<id>`): two 3D heads replaying a pre-rendered song
 const DuetPage = lazy(() => import("./components/DuetPage.tsx").then((m) => ({ default: m.DuetPage })));
 
-/** the show to play, from `?show=<id>` (a plain folder name under public/shows) */
-function showId(): string | null {
-  const id = new URLSearchParams(window.location.search).get("show");
+// a tape (`?tape=<id>`): heads replaying a show, composed on one canvas to record as a video
+const TapePage = lazy(() => import("../tape/TapePage.tsx").then((m) => ({ default: m.TapePage })));
+
+/** a plain folder name under public/shows from the query string: `?show=<id>` or `?tape=<id>` */
+function folderId(param: "show" | "tape"): string | null {
+  const id = new URLSearchParams(window.location.search).get(param);
   return id && /^[\w-]+$/.test(id) ? id : null;
 }
 
@@ -180,7 +183,14 @@ function PlayRight() {
 }
 
 export function App() {
-  const show = showId();
+  const tape = folderId("tape");
+  if (tape)
+    return (
+      <Suspense fallback={null}>
+        <TapePage id={tape} />
+      </Suspense>
+    );
+  const show = folderId("show");
   if (show)
     return (
       <Suspense fallback={null}>

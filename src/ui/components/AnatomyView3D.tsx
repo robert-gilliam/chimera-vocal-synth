@@ -35,6 +35,11 @@ export interface HeadFeed {
   frame(): { tele: TelemetryMessage | null; artic: HumanArtic; epoch: number };
   /** cap on the device pixel ratio (two heads on a phone draw half the pixels at 1.5) */
   maxDpr?: number;
+  /**
+   * draw at exactly this pixel ratio, whatever the device's (the tape page copies the head onto
+   * a larger canvas, and sizes each head for the largest copy); `maxDpr` is then unused
+   */
+  dpr?: number;
   /** which way the head turns to show its face (see Anatomy3D.facing) */
   facing?: 1 | -1;
 }
@@ -149,7 +154,7 @@ export function AnatomyView3D(props: { slots?: SlotsFn; info?: InfoFn; showForma
     canvas.addEventListener("pointerleave", offHead);
 
     let w = 0, h = 0, dpr = 1;
-    const maxDpr = () => Math.min(feedRef.current?.maxDpr ?? 2, window.devicePixelRatio || 1);
+    const maxDpr = () => feedRef.current?.dpr ?? Math.min(feedRef.current?.maxDpr ?? 2, window.devicePixelRatio || 1);
     /** a fed head (no settings of its own to keep) goes back to its framing when its pane changes shape */
     let refit = false;
     const fit = () => {
