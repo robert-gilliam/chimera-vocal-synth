@@ -469,3 +469,132 @@ fn render_notes_tele_records_the_live_telemetry_without_changing_the_sound() {
     let a_lip = artic["frames"][96][lip].as_f64().unwrap(); // 0.96 s = 60 tele hops
     assert!((at(60, 11 + lip) as f64 - a_lip).abs() < 1e-3, "lipAp {} vs {a_lip}", at(60, 11 + lip));
 }
+
+/// 16-bit mono samples of a WAV the CLI wrote.
+fn pcm(path: &str) -> Vec<i16> {
+    let b = std::fs::read(path).unwrap_or_else(|e| panic!("{path}: {e}"));
+    b[44..].chunks_exact(2).map(|c| i16::from_le_bytes([c[0], c[1]])).collect()
+}
+
+/// A `--tele` file's header: (frames, frameLen, hop, body mix), having checked its size.
+fn tele_header(path: &str) -> (usize, usize, usize, (f32, f32)) {
+    let t = std::fs::read(path).unwrap_or_else(|e| panic!("{path}: {e}"));
+    assert_eq!(&t[..4], b"CHTL");
+    let u = |i: usize| u32::from_le_bytes(t[4 + 4 * i..8 + 4 * i].try_into().unwrap()) as usize;
+    let f = |o: usize| f32::from_le_bytes(t[o..o + 4].try_into().unwrap());
+    let (version, rate, hop, frames, len, n_artic, n_ph, n_or, n_scope) = (u(0), u(1), u(2), u(3), u(4), u(5), u(6), u(7), u(8));
+    assert_eq!((version, rate, hop, n_artic, n_scope), (1, 48000, 768, 17, 32));
+    assert_eq!(len, 11 + n_artic + 3 * (n_ph + n_or) + 2 * n_scope);
+    assert_eq!(t.len(), 48 + 4 * frames * len, "{path}: header and size disagree");
+    (frames, len, hop, (f(40), f(44)))
+}
+
+#[test]
+fn render_hits_land_at_their_times_as_the_sequencer_plays_them() {
+    // One bar through the sequencer (`render beatbox`: the first step 0.2 s in, sixteenths at
+    // 100 bpm), then the same sounds as free hits at those times: a sustained sound lasts until
+    // the next one, and the hum's note and the accent carry over. The sequencer loops, so its
+    // 1.7 s also hold the start of the bar again (the last of those sets up as the render ends).
+    let dir = tmp("hits-seq");
+    chimera(&["render", "beatbox", &dir, "B m:43 . t | Pf> . . .", "male", "100", "1"]);
+    let step = 60.0 / 100.0 / 4.0;
+    let at = |n: usize| 0.2 + n as f64 * step;
+    let j = serde_json::json!({ "end": 1.7, "hits": [
+        [at(0), "B", step],
+        [at(1), "m", 2.0 * step, 43],
+        [at(3), "t", step],
+        [at(4), "Pf", 4.0 * step, null, 1.3],
+        [at(8), "B", step],
+        [at(9), "m", 2.0 * step, 43],
+        [at(11), "t", step],
+    ] });
+    let (input, stem) = (tmp("hits.json"), tmp("hits"));
+    std::fs::write(&input, j.to_string()).unwrap();
+    let stdout = chimera(&["render", "hits", &input, &stem]);
+    assert!(stdout.starts_with(&format!("wrote {stem}.wav  1.70 s  peak ")) && stdout.contains("7 hits"), "{stdout}");
+    let (seq, free) = (pcm(&format!("{dir}/pattern.wav")), pcm(&format!("{stem}.wav")));
+    assert_eq!(free.len(), 81600);
+    assert!(seq == free, "free hits differ from the sequencer's steps");
+
+    // and the kick and the snare start at their times: the first sample from 40 ms before the
+    // hit to reach a quarter of the hit's peak is within 15 ms of it (the snare's burst leads by
+    // 10; the hi-hat has no onset to find here, it follows the hum)
+    let s = |t: f64| (t * 48000.0).round() as usize;
+    let abs = |i: usize| free[i].unsigned_abs();
+    for (n, id) in [(0, "B"), (4, "Pf")] {
+        let t = at(n);
+        let peak = (s(t - 0.03)..s(t + 0.08)).map(abs).max().unwrap();
+        assert!(peak > 1500, "{id} at {t}: peak {peak}");
+        let onset = (s(t - 0.04)..s(t + 0.08)).find(|i| abs(*i) > peak / 4).unwrap();
+        let early_ms = (onset as f64 / 48000.0 - t) * 1000.0;
+        assert!(early_ms.abs() < 15.0, "{id} at {t}: onset {early_ms} ms off");
+    }
+}
+
+#[test]
+fn render_hits_refuses_an_unknown_sound_and_a_hit_with_no_room_to_set_up() {
+    let fails = |name: &str, j: serde_json::Value| -> String {
+        let input = tmp(name);
+        std::fs::write(&input, j.to_string()).unwrap();
+        let out = Command::new(env!("CARGO_BIN_EXE_chimera")).args(["render", "hits", &input, &tmp("hits-refused")]).output().unwrap();
+        assert!(!out.status.success(), "{name} rendered");
+        String::from_utf8_lossy(&out.stderr).into_owned()
+    };
+    // a sound the kit lacks is an error, not a silent gap in the beat
+    let err = fails("hits-unknown.json", serde_json::json!({ "end": 1, "hits": [[0.3, "B"], [0.6, "zz"]] }));
+    assert!(err.contains("hit 1: unknown beat sound \"zz\"") && err.contains("have B t tss"), "{err}");
+    // the notation's own spelling is one id; its accent mark is not part of it
+    let err = fails("hits-accent.json", serde_json::json!({ "end": 1, "hits": [[0.3, "B>"]] }));
+    assert!(err.contains("unknown beat sound \"B>\""), "{err}");
+    // the lip pop starts 173 ms before it is heard
+    let err = fails("hits-early.json", serde_json::json!({ "end": 1, "hits": [[0.05, "P!"]] }));
+    assert!(err.contains("hit 0: P! needs 0.173 s of set-up"), "{err}");
+    let err = fails("hits-no-end.json", serde_json::json!({ "hits": [[0.3, "B"]] }));
+    assert!(err.contains("\"end\" (seconds) missing"), "{err}");
+}
+
+#[test]
+fn render_text_and_hits_tele_frame_the_whole_render_without_changing_the_sound() {
+    // speech: `render text --tele`
+    let (plain, tracked, tele) = (tmp("say-plain"), tmp("say-tracked"), tmp("say.tele"));
+    chimera(&["render", "text", &plain, "Good morning.", "female"]);
+    let stdout = chimera(&["render", "text", &tracked, "Good morning.", "female", "--tele", &tele]);
+    let a = std::fs::read(format!("{plain}.wav")).unwrap();
+    assert!(a == std::fs::read(format!("{tracked}.wav")).unwrap(), "--tele changed the speech");
+    let samples = (a.len() - 44) / 2;
+    let (frames, len, hop, mix) = tele_header(&tele);
+    // frame 0 before any sound, then one per whole hop of the render
+    assert_eq!(frames, 1 + samples / hop, "{stdout}");
+    assert!(stdout.contains(&format!("{tele}: {frames} telemetry frames every 768 samples")), "{stdout}");
+    assert_eq!(mix, (1.0, 0.0), "body mix: female");
+    let t = std::fs::read(&tele).unwrap();
+    let at = |i: usize, k: usize| f32::from_le_bytes(t[48 + 4 * (i * len + k)..52 + 4 * (i * len + k)].try_into().unwrap());
+    assert!((at(frames - 1, 10) as f64 - ((frames - 1) * hop) as f64 / 48000.0).abs() < 1e-4, "the last frame's clock");
+    // the voice speaks: some frame is loud and voiced near the speaking pitch (205 Hz)
+    assert!((0..frames).any(|i| at(i, 6) > 1e-2 && at(i, 4) > 0.5 && (at(i, 3) - 205.0).abs() < 60.0), "no voiced frame");
+
+    // beat sounds: `render hits --tele`, the flag anywhere among the arguments
+    let input = tmp("hits-tele.json");
+    std::fs::write(&input, serde_json::json!({ "end": 1.25, "hits": [[0.5, "B"], [0.9, "t"]] }).to_string()).unwrap();
+    let (plain, tracked, tele) = (tmp("hits-plain"), tmp("hits-tracked"), tmp("hits.tele"));
+    chimera(&["render", "hits", &input, &plain]);
+    let stdout = chimera(&["render", "hits", "--tele", &tele, &input, &tracked]);
+    let a = pcm(&format!("{plain}.wav"));
+    assert!(a == pcm(&format!("{tracked}.wav")), "--tele changed the beat");
+    assert_eq!(a.len(), 60000, "1.25 s");
+    let (frames, len, hop, mix) = tele_header(&tele);
+    assert_eq!(frames, 1 + 60000 / hop, "{stdout}");
+    assert_eq!(frames, 79);
+    assert_eq!(mix, (0.0, 0.0), "body mix: male");
+    let t = std::fs::read(&tele).unwrap();
+    let at = |i: usize, k: usize| f32::from_le_bytes(t[48 + 4 * (i * len + k)..52 + 4 * (i * len + k)].try_into().unwrap());
+    // the kick is in the frames after 0.5 s (frame 32 covers 0.496–0.512 s), silence before it
+    let out_rms = |i: usize| at(i, 6);
+    assert!((1..20).all(|i| out_rms(i) < 1e-3), "noise before the kick sets up");
+    let kick = (31..35).map(out_rms).fold(0f32, f32::max);
+    assert!(kick > 1e-2, "kick rms {kick}");
+    // and the lips shut for the kick's build-up (lipAp: articulator 7)
+    let lip = 11 + 7;
+    let shut = (24..32).map(|i| at(i, lip)).fold(f32::MAX, f32::min);
+    assert!(shut < 0.05, "lips never shut before the kick: {shut}");
+}

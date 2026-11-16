@@ -11,7 +11,7 @@ use chimera::creatures::types::ParamRole;
 use chimera::creatures::voice::CreatureVoice;
 use chimera::creatures::{CREATURES, creature_by_id};
 use chimera::math::{js_max, js_min, js_round, log10};
-use chimera::phonetics::beatbox::{BEAT_PRESETS, BEAT_SOUNDS, BeatStep, beat_ready, parse_beat};
+use chimera::phonetics::beatbox::{BEAT_PRESETS, BEAT_SOUNDS, BeatStep, beat_ready, beat_sound, parse_beat};
 use chimera::phonetics::english::EnglishG2P;
 use chimera::phonetics::ipa::{skipped_ipa, tokenize_ipa};
 use chimera::phonetics::planner::{
@@ -158,6 +158,11 @@ pub fn text_f0(body_name: &str) -> f64 {
 /// Say `text` the way `render text` does: CMUdict G2P, the phrase planner from t0 = 50 ms, the
 /// body's speaking f0, 300 ms of tail. `chimera compare tsp` measures exactly these renders.
 pub fn say(g: &EnglishG2P, text: &str, body_name: &str) -> Result<Spoken, String> {
+    say_with(g, text, body_name, false).map(|(s, _)| s)
+}
+
+/// [`say`], optionally recording the voice's telemetry (`render text … --tele`).
+fn say_with(g: &EnglishG2P, text: &str, body_name: &str, tele: bool) -> Result<(Spoken, Option<TeleRecorder>), String> {
     let b = body(body_name)?;
     let f0 = text_f0(body_name);
     let phrases = g.to_phrases(text);
@@ -198,18 +203,22 @@ pub fn say(g: &EnglishG2P, text: &str, body_name: &str) -> Result<Spoken, String
     voice.schedule(&plan.gestures);
     let total = js_round(FS * (plan.end + 0.3)) as usize;
     let mut out = vec![0f32; total];
-    render_blocks(&mut voice, &mut out);
-    Ok(Spoken { out, plan, shown: shown.join(" | ") })
+    let (_, rec) = render_tracked(&mut voice, &mut out, false, tele)?;
+    Ok((Spoken { out, plan, shown: shown.join(" | ") }, rec))
 }
 
-/// English text through G2P and the phrase planner. `render text <out> ["Text."] [body]`
+/// English text through G2P and the phrase planner.
+/// `render text <out> ["Text."] [body] [--tele voice.tele]`: `--tele` also writes the voice's
+/// telemetry over time (see `TeleRecorder`), as `render notes --tele` does for singing.
 pub fn text(ctx: &Ctx, a: &[String]) -> Result<(), String> {
+    let (rest, tele_out) = take_tele(a)?;
+    let a = &rest[..];
     let name = arg(a, 0, "out/text");
     let text = arg(a, 1, "Hello world.");
     let body_name = arg(a, 2, "male");
     let g = g2p()?;
     let t = Instant::now();
-    let s = say(&g, text, body_name)?;
+    let (s, rec) = say_with(&g, text, body_name, tele_out.is_some())?;
     let ms = ms_since(t);
     println!("{}", s.shown);
     let file = wav_name(name);
@@ -219,6 +228,85 @@ pub fn text(ctx: &Ctx, a: &[String]) -> Result<(), String> {
         fixed(s.out.len() as f64 / FS, 2),
         fixed(ms, 0)
     );
+    if let (Some(path), Some(r)) = (&tele_out, rec) {
+        write_tele(path, &r, body_name)?;
+    }
+    Ok(())
+}
+
+/// Arguments less a `--tele <file>` pair.
+fn take_tele(a: &[String]) -> Result<(Vec<String>, Option<String>), String> {
+    let (mut rest, mut tele) = (Vec::new(), None);
+    let mut it = a.iter();
+    while let Some(x) = it.next() {
+        if x == "--tele" {
+            tele = Some(it.next().ok_or("--tele needs a file")?.clone());
+        } else {
+            rest.push(x.clone());
+        }
+    }
+    Ok((rest, tele))
+}
+
+/// Write a render's telemetry (`--tele`), in the body's mix, and say so as `render notes` does.
+fn write_tele(path: &str, rec: &TeleRecorder, body_name: &str) -> Result<(), String> {
+    std::fs::write(path, rec.bytes(body_mix(body_name)?)).map_err(|e| format!("{path}: {e}"))?;
+    println!("{path}: {} telemetry frames every {TELE_HOP} samples", rec.frames);
+    Ok(())
+}
+
+/// Beatbox sounds at free times on one voice: `render hits <in.json> <out> [body] [--tele f]`.
+/// The file: `{"end": seconds, "hits": [[time, "B", len?, note?, accent?], ...]}`: the sound
+/// `id` (a `BEAT_SOUNDS` id, as the beat notation writes it) lands at `time`, may last `len`
+/// seconds (0.15 when absent; sustained sounds use it), a hum's MIDI `note`, and an `accent`
+/// (1 plain; the notation's `>` is 1.3). Each hit is built as the sequencer builds a step
+/// (`BeatPlayer::gestures`), so a sound here is the sound in a pattern; the render is `end` long.
+pub fn hits(ctx: &Ctx, a: &[String]) -> Result<(), String> {
+    let (rest, tele_out) = take_tele(a)?;
+    let a = &rest[..];
+    let input = a.first().ok_or("render hits <in.json> <out> [male|female|child] [--tele voice.tele]")?;
+    let out_name = wav_name(arg(a, 1, "out/hits"));
+    let body_name = arg(a, 2, "male");
+    let b = body(body_name)?;
+    let text = std::fs::read_to_string(input).map_err(|e| format!("{input}: {e}"))?;
+    let j: serde_json::Value = serde_json::from_str(&text).map_err(|e| format!("{input}: {e}"))?;
+    let end = j["end"].as_f64().filter(|e| *e > 0.0).ok_or_else(|| format!("{input}: \"end\" (seconds) missing"))?;
+    let list = j["hits"].as_array().ok_or_else(|| format!("{input}: \"hits\" missing"))?;
+    // the voice the beatbox render and the app's Beat mode start from
+    let mut v = HumanVoice::new(FS, b, 2);
+    v.set_articulation(&beat_ready(body_name.into()), None);
+    v.set_source(&SourcePatch { f0: Some(100.0), voiced: Some(true), pressure: Some(8.0), ..Default::default() });
+    v.set_gate(0.0);
+    let mut player = BeatPlayer::new();
+    player.body = body_name.into();
+    let mut gs = Vec::new();
+    for (i, h) in list.iter().enumerate() {
+        let bad = |what: &str| format!("{input}: hit {i}: {what} in {h}");
+        let t = h[0].as_f64().ok_or_else(|| bad("no time"))?;
+        let id = h[1].as_str().ok_or_else(|| bad("no sound id"))?;
+        if beat_sound(id).is_none() {
+            let have: Vec<&str> = BEAT_SOUNDS.iter().map(|s| s.id).collect();
+            return Err(format!("{input}: hit {i}: unknown beat sound {id:?}; have {}", have.join(" ")));
+        }
+        // a sound sets up before it is heard: one too close to the start would begin part-way
+        let lead = BeatPlayer::lead_in(id, body_name.into());
+        if t < lead {
+            return Err(bad(&format!("{id} needs {} s of set-up before its hit", fixed(lead, 3))));
+        }
+        let mut step = BeatStep::new(id);
+        step.note = h[3].as_f64();
+        step.accent = h[4].as_f64();
+        gs.clear();
+        player.gestures(&step, t, h[2].as_f64().unwrap_or(0.15), &mut gs);
+        v.schedule(&gs);
+    }
+    let mut out = vec![0f32; js_round(FS * end) as usize];
+    let (_, rec) = render_tracked(&mut v, &mut out, false, tele_out.is_some())?;
+    ctx.write_wav(&out_name, &out)?;
+    println!("wrote {out_name}  {} s  peak {}  {} hits", fixed(end, 2), fixed(peak(&out), 3), list.len());
+    if let (Some(path), Some(r)) = (&tele_out, rec) {
+        write_tele(path, &r, body_name)?;
+    }
     Ok(())
 }
 
